@@ -59,6 +59,7 @@ type Server struct {
 	healthchecker *healthchecker
 	janitor       *janitor
 	aggregator    *aggregator
+	taskNotifier  *taskNotifier // nil when EnableTaskNotification is false
 }
 
 type serverState struct {
@@ -262,6 +263,15 @@ type Config struct {
 	//
 	// If set to a zero or not set, NewServer will not limit concurrency of the queue.
 	QueueConcurrency map[string]int
+
+	// EnableTaskNotification enables Redis Pub/Sub based notifications for
+	// near-real-time task processing. When enabled, the processor wakes up
+	// immediately when a task enters the pending state, instead of waiting
+	// for the next TaskCheckInterval poll.
+	//
+	// TaskCheckInterval polling remains active as a fallback.
+	// Default is false (polling only).
+	EnableTaskNotification bool
 }
 
 // GroupAggregator aggregates a group of tasks into one before the tasks are passed to the Handler.
@@ -515,7 +525,11 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 	}
 	logger.SetLevel(toInternalLogLevel(loglevel))
 
-	rdb := rdb.NewRDB(c, rdb.WithQueueConcurrency(cfg.QueueConcurrency))
+	rdbOpts := []rdb.Option{rdb.WithQueueConcurrency(cfg.QueueConcurrency)}
+	if cfg.EnableTaskNotification {
+		rdbOpts = append(rdbOpts, rdb.WithTaskNotification())
+	}
+	rdb := rdb.NewRDB(c, rdbOpts...)
 	starting := make(chan *workerInfo)
 	finished := make(chan *base.TaskMessage)
 	syncCh := make(chan *syncRequest)
@@ -553,6 +567,19 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 		broker:       rdb,
 		cancelations: cancels,
 	})
+
+	// Optionally create taskNotifier for near-real-time task processing.
+	var notifier *taskNotifier
+	var taskReadyCh <-chan struct{}
+	if cfg.EnableTaskNotification {
+		notifier = newTaskNotifier(taskNotifierParams{
+			logger: logger,
+			broker: rdb,
+			queues: qnames,
+		})
+		taskReadyCh = notifier.C()
+	}
+
 	processor := newProcessor(processorParams{
 		logger:            logger,
 		broker:            rdb,
@@ -569,6 +596,7 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 		shutdownTimeout:   shutdownTimeout,
 		starting:          starting,
 		finished:          finished,
+		taskReadyCh:       taskReadyCh,
 	})
 	recoverer := newRecoverer(recovererParams{
 		logger:         logger,
@@ -630,6 +658,7 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 		healthchecker:    healthchecker,
 		janitor:          janitor,
 		aggregator:       aggregator,
+		taskNotifier:     notifier,
 	}
 }
 
@@ -708,6 +737,9 @@ func (srv *Server) Start(handler Handler) error {
 	srv.syncer.start(&srv.wg)
 	srv.recoverer.start(&srv.wg)
 	srv.forwarder.start(&srv.wg)
+	if srv.taskNotifier != nil {
+		srv.taskNotifier.start(&srv.wg)
+	}
 	srv.processor.start(&srv.wg)
 	srv.janitor.start(&srv.wg)
 	srv.aggregator.start(&srv.wg)
@@ -755,6 +787,9 @@ func (srv *Server) Shutdown() {
 	srv.recoverer.shutdown()
 	srv.syncer.shutdown()
 	srv.subscriber.shutdown()
+	if srv.taskNotifier != nil {
+		srv.taskNotifier.shutdown()
+	}
 	srv.janitor.shutdown()
 	srv.aggregator.shutdown()
 	srv.healthchecker.shutdown()
@@ -824,6 +859,9 @@ func (srv *Server) AddQueue(qname string, priority, concurrency int) {
 	srv.recoverer.shutdown()
 	srv.syncer.shutdown()
 	srv.subscriber.shutdown()
+	if srv.taskNotifier != nil {
+		srv.taskNotifier.shutdown()
+	}
 	srv.janitor.shutdown()
 	srv.aggregator.shutdown()
 	srv.healthchecker.shutdown()
@@ -851,6 +889,9 @@ func (srv *Server) AddQueue(qname string, priority, concurrency int) {
 	srv.janitor.queues = qnames
 	srv.aggregator.resetState()
 	srv.aggregator.queues = qnames
+	if srv.taskNotifier != nil {
+		srv.taskNotifier.queues = qnames
+	}
 
 	srv.heartbeater.start(&srv.wg)
 	srv.healthchecker.start(&srv.wg)
@@ -858,6 +899,9 @@ func (srv *Server) AddQueue(qname string, priority, concurrency int) {
 	srv.syncer.start(&srv.wg)
 	srv.recoverer.start(&srv.wg)
 	srv.forwarder.start(&srv.wg)
+	if srv.taskNotifier != nil {
+		srv.taskNotifier.start(&srv.wg)
+	}
 	srv.processor.start(&srv.wg)
 	srv.janitor.start(&srv.wg)
 	srv.aggregator.start(&srv.wg)

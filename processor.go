@@ -69,6 +69,11 @@ type processor struct {
 	// cancelations is a set of cancel functions for all active tasks.
 	cancelations *base.Cancelations
 
+	// taskReadyCh is an optional channel that receives signals when new tasks
+	// are available. When set, the processor uses it for near-real-time wakeup
+	// instead of relying solely on taskCheckInterval polling.
+	taskReadyCh <-chan struct{}
+
 	starting chan<- *workerInfo
 	finished chan<- *base.TaskMessage
 }
@@ -89,6 +94,7 @@ type processorParams struct {
 	shutdownTimeout   time.Duration
 	starting          chan<- *workerInfo
 	finished          chan<- *base.TaskMessage
+	taskReadyCh       <-chan struct{}
 }
 
 // newProcessor constructs a new processor.
@@ -121,6 +127,7 @@ func newProcessor(params processorParams) *processor {
 		shutdownTimeout:   params.shutdownTimeout,
 		starting:          params.starting,
 		finished:          params.finished,
+		taskReadyCh:       params.taskReadyCh,
 	}
 }
 
@@ -190,11 +197,30 @@ func (p *processor) exec() {
 		case errors.Is(err, errors.ErrNoProcessableTask):
 			p.logger.Debug("All queues are empty")
 			// Queues are empty, this is a normal behavior.
-			// Sleep to avoid slamming redis and let scheduler move tasks into queues.
-			// Note: We are not using blocking pop operation and polling queues instead.
-			// This adds significant load to redis.
+			// Wait for a pub/sub notification or fall back to polling interval.
 			jitter := rand.N(p.taskCheckInterval)
-			time.Sleep(p.taskCheckInterval/2 + jitter)
+			timer := time.NewTimer(p.taskCheckInterval/2 + jitter)
+			if p.taskReadyCh != nil {
+				select {
+				case <-p.taskReadyCh:
+					// Task ready notification received, retry immediately.
+					timer.Stop()
+				case <-timer.C:
+					// Fallback polling.
+				case <-p.quit:
+					timer.Stop()
+					<-p.sema // release token
+					return
+				}
+			} else {
+				select {
+				case <-timer.C:
+				case <-p.quit:
+					timer.Stop()
+					<-p.sema // release token
+					return
+				}
+			}
 			<-p.sema // release token
 			return
 		case err != nil:

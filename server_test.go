@@ -60,6 +60,163 @@ func TestServer(t *testing.T) {
 	testServer(t, c, srv)
 }
 
+func TestTaskNotificationEndToEnd(t *testing.T) {
+	ignoreOpt := goleak.IgnoreTopFunction("github.com/redis/go-redis/v9/internal/pool.(*ConnPool).reaper")
+	defer goleak.VerifyNone(t, ignoreOpt)
+
+	redisConnOpt := getRedisConnOpt(t)
+
+	// Use a very long TaskCheckInterval so polling alone would never pick up the task
+	// within our deadline. If the task is processed quickly, it proves pub/sub worked.
+	srv := NewServer(redisConnOpt, Config{
+		Concurrency:            10,
+		LogLevel:               testLogLevel,
+		TaskCheckInterval:      30 * time.Second,
+		EnableTaskNotification: true,
+	})
+
+	// Client with notification enabled — publishes to the task-ready channel on enqueue.
+	c := NewClientWithNotification(redisConnOpt)
+	defer c.Close()
+
+	processed := make(chan struct{}, 1)
+	handler := HandlerFunc(func(ctx context.Context, task *Task) error {
+		select {
+		case processed <- struct{}{}:
+		default:
+		}
+		return nil
+	})
+
+	if err := srv.Start(handler); err != nil {
+		t.Fatalf("srv.Start failed: %v", err)
+	}
+
+	// Wait for the server to fully start (subscriber established, etc.)
+	time.Sleep(1 * time.Second)
+
+	_, err := c.Enqueue(NewTask("test:notification", nil))
+	if err != nil {
+		t.Fatalf("c.Enqueue failed: %v", err)
+	}
+
+	// Task must be processed within 3 seconds. With a 30s TaskCheckInterval,
+	// this can only succeed if the pub/sub notification woke the processor.
+	select {
+	case <-processed:
+		// success — task was processed via pub/sub notification
+	case <-time.After(3 * time.Second):
+		t.Error("task was not processed within 3s; pub/sub notification likely failed")
+	}
+
+	srv.Shutdown()
+}
+
+func TestTaskNotificationEndToEndWithoutClientNotification(t *testing.T) {
+	ignoreOpt := goleak.IgnoreTopFunction("github.com/redis/go-redis/v9/internal/pool.(*ConnPool).reaper")
+	defer goleak.VerifyNone(t, ignoreOpt)
+
+	redisConnOpt := getRedisConnOpt(t)
+
+	// Server with notification enabled and a short TaskCheckInterval (for polling fallback).
+	srv := NewServer(redisConnOpt, Config{
+		Concurrency:            10,
+		LogLevel:               testLogLevel,
+		TaskCheckInterval:      1 * time.Second,
+		EnableTaskNotification: true,
+	})
+
+	// Client WITHOUT notification — uses standard NewClient (no pub/sub publish).
+	c := NewClient(redisConnOpt)
+	defer c.Close()
+
+	processed := make(chan struct{}, 1)
+	handler := HandlerFunc(func(ctx context.Context, task *Task) error {
+		select {
+		case processed <- struct{}{}:
+		default:
+		}
+		return nil
+	})
+
+	if err := srv.Start(handler); err != nil {
+		t.Fatalf("srv.Start failed: %v", err)
+	}
+
+	time.Sleep(1 * time.Second)
+
+	_, err := c.Enqueue(NewTask("test:fallback", nil))
+	if err != nil {
+		t.Fatalf("c.Enqueue failed: %v", err)
+	}
+
+	// Even without client-side notification, polling fallback should process the task
+	// within 3 seconds (TaskCheckInterval is 1s).
+	select {
+	case <-processed:
+		// success — polling fallback worked
+	case <-time.After(3 * time.Second):
+		t.Error("task was not processed within 3s via polling fallback")
+	}
+
+	srv.Shutdown()
+}
+
+func TestTaskNotificationForwarderNotifies(t *testing.T) {
+	ignoreOpt := goleak.IgnoreTopFunction("github.com/redis/go-redis/v9/internal/pool.(*ConnPool).reaper")
+	defer goleak.VerifyNone(t, ignoreOpt)
+
+	redisConnOpt := getRedisConnOpt(t)
+
+	// Server with notification and a very long TaskCheckInterval.
+	// The forwarder moves scheduled tasks to pending, which should trigger pub/sub.
+	srv := NewServer(redisConnOpt, Config{
+		Concurrency:            10,
+		LogLevel:               testLogLevel,
+		TaskCheckInterval:      30 * time.Second,
+		EnableTaskNotification: true,
+	})
+
+	// Client without notification — the server's forwarder will publish when
+	// moving the task from scheduled to pending.
+	c := NewClient(redisConnOpt)
+	defer c.Close()
+
+	processed := make(chan struct{}, 1)
+	handler := HandlerFunc(func(ctx context.Context, task *Task) error {
+		select {
+		case processed <- struct{}{}:
+		default:
+		}
+		return nil
+	})
+
+	if err := srv.Start(handler); err != nil {
+		t.Fatalf("srv.Start failed: %v", err)
+	}
+
+	time.Sleep(1 * time.Second)
+
+	// Schedule the task to be processed 1 second from now.
+	_, err := c.Enqueue(NewTask("test:scheduled", nil), ProcessIn(1*time.Second))
+	if err != nil {
+		t.Fatalf("c.Enqueue failed: %v", err)
+	}
+
+	// The forwarder checks scheduled tasks every 5s by default. After moving
+	// the task to pending, the server's RDB publishes a task-ready notification.
+	// With 30s TaskCheckInterval, the processor can only pick it up via pub/sub.
+	// Allow up to 10s for the forwarder interval + notification propagation.
+	select {
+	case <-processed:
+		// success
+	case <-time.After(10 * time.Second):
+		t.Error("scheduled task was not processed within 10s; forwarder notification likely failed")
+	}
+
+	srv.Shutdown()
+}
+
 func TestServerFromRedisClient(t *testing.T) {
 	// https://github.com/go-redis/redis/issues/1029
 	ignoreOpt := goleak.IgnoreTopFunction("github.com/redis/go-redis/v9/internal/pool.(*ConnPool).reaper")

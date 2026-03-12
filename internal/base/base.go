@@ -152,6 +152,12 @@ func CompletedKey(qname string) string {
 	return QueueKeyPrefix(qname) + "completed"
 }
 
+// TaskReadyChannel returns a Redis Pub/Sub channel name used to notify
+// processors that new tasks are available in the given queue.
+func TaskReadyChannel(qname string) string {
+	return QueueKeyPrefix(qname) + "task_ready"
+}
+
 // PausedKey returns a redis key to indicate that the given queue is paused.
 func PausedKey(qname string) string {
 	return QueueKeyPrefix(qname) + "paused"
@@ -726,6 +732,10 @@ type Broker interface {
 	// Cancelation related methods
 	CancelationPubSub() (*redis.PubSub, error) // TODO: Need to decouple from redis to support other brokers
 	PublishCancelation(id string) error
+
+	// Task ready notification methods
+	TaskReadyPubSub(qnames ...string) (*redis.PubSub, error)
+	PublishTaskReady(qname string) error
 
 	WriteResult(qname, id string, data []byte) (n int, err error)
 	SetQueueConcurrency(qname string, concurrency int)

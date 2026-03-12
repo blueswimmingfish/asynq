@@ -41,6 +41,21 @@ func NewClient(r RedisConnOpt) *Client {
 	return client
 }
 
+// NewClientWithNotification returns a new Client that publishes task-ready
+// notifications via Redis Pub/Sub when enqueuing tasks. This enables
+// near-real-time task processing on servers with EnableTaskNotification set.
+func NewClientWithNotification(r RedisConnOpt) *Client {
+	redisClient, ok := r.MakeRedisClient().(redis.UniversalClient)
+	if !ok {
+		panic(fmt.Sprintf("asynq: unsupported RedisConnOpt type %T", r))
+	}
+	client := &Client{
+		broker:           rdb.NewRDB(redisClient, rdb.WithTaskNotification()),
+		sharedConnection: false,
+	}
+	return client
+}
+
 // NewClientFromRedisClient returns a new instance of Client given a redis.UniversalClient
 // Warning: The underlying redis connection pool will not be closed by Asynq, you are responsible for closing it.
 func NewClientFromRedisClient(c redis.UniversalClient) *Client {

@@ -3362,6 +3362,126 @@ func TestCancelationPubSub(t *testing.T) {
 	mu.Unlock()
 }
 
+func TestTaskReadyPubSub(t *testing.T) {
+	r := setup(t)
+	defer r.Close()
+
+	// Enable task notification for this test.
+	r.enableTaskNotification = true
+
+	qnames := []string{"default", "critical"}
+	pubsub, err := r.TaskReadyPubSub(qnames...)
+	if err != nil {
+		t.Fatalf("(*RDB).TaskReadyPubSub() returned an error: %v", err)
+	}
+
+	msgCh := pubsub.Channel()
+
+	var (
+		mu       sync.Mutex
+		received []string
+	)
+
+	go func() {
+		for msg := range msgCh {
+			mu.Lock()
+			received = append(received, msg.Channel)
+			mu.Unlock()
+		}
+	}()
+
+	// Publish to both queues.
+	for _, qname := range qnames {
+		if err := r.PublishTaskReady(qname); err != nil {
+			t.Fatalf("(*RDB).PublishTaskReady(%q) returned an error: %v", qname, err)
+		}
+	}
+
+	// Allow time for async publish and messages to reach the subscriber.
+	time.Sleep(time.Second)
+
+	pubsub.Close()
+
+	wantChannels := []string{
+		base.TaskReadyChannel("default"),
+		base.TaskReadyChannel("critical"),
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if diff := cmp.Diff(wantChannels, received, h.SortStringSliceOpt); diff != "" {
+		t.Errorf("subscriber received channels %v, want %v; (-want,+got)\n%s", received, wantChannels, diff)
+	}
+}
+
+func TestEnqueuePublishesTaskReady(t *testing.T) {
+	r := setup(t)
+	defer r.Close()
+
+	// Enable task notification for this test.
+	r.enableTaskNotification = true
+
+	qname := "default"
+	pubsub, err := r.TaskReadyPubSub(qname)
+	if err != nil {
+		t.Fatalf("TaskReadyPubSub returned error: %v", err)
+	}
+	defer pubsub.Close()
+
+	msgCh := pubsub.Channel()
+
+	// Allow subscription to be established.
+	time.Sleep(500 * time.Millisecond)
+
+	msg := &base.TaskMessage{
+		ID:      uuid.NewString(),
+		Type:    "test:task",
+		Payload: []byte("{}"),
+		Queue:   qname,
+		Retry:   3,
+		Timeout: 1800,
+	}
+	if err := r.Enqueue(context.Background(), msg); err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+
+	select {
+	case m := <-msgCh:
+		if m.Channel != base.TaskReadyChannel(qname) {
+			t.Errorf("received on channel %q, want %q", m.Channel, base.TaskReadyChannel(qname))
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("timed out waiting for task ready notification after Enqueue")
+	}
+}
+
+func TestPublishTaskReadyNoOpWhenDisabled(t *testing.T) {
+	r := setup(t)
+	defer r.Close()
+
+	// enableTaskNotification is false by default.
+	qname := "default"
+	pubsub, err := r.TaskReadyPubSub(qname)
+	if err != nil {
+		t.Fatalf("TaskReadyPubSub returned error: %v", err)
+	}
+	defer pubsub.Close()
+
+	msgCh := pubsub.Channel()
+
+	time.Sleep(500 * time.Millisecond)
+
+	// This should be a no-op since notification is not enabled.
+	r.PublishTaskReady(qname)
+
+	select {
+	case <-msgCh:
+		t.Error("received unexpected notification when task notification is disabled")
+	case <-time.After(500 * time.Millisecond):
+		// Expected: no message received.
+	}
+}
+
 func TestWriteResult(t *testing.T) {
 	r := setup(t)
 	defer r.Close()

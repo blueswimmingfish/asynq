@@ -36,12 +36,21 @@ func WithQueueConcurrency(queueConcurrency map[string]int) Option {
 	}
 }
 
+// WithTaskNotification enables asynchronous task-ready notifications via
+// Redis Pub/Sub when tasks enter the pending state.
+func WithTaskNotification() Option {
+	return func(r *RDB) {
+		r.enableTaskNotification = true
+	}
+}
+
 // RDB is a client interface to query and mutate task queues.
 type RDB struct {
-	client           redis.UniversalClient
-	clock            timeutil.Clock
-	queuesPublished  sync.Map
-	queueConcurrency sync.Map
+	client                 redis.UniversalClient
+	clock                  timeutil.Clock
+	queuesPublished        sync.Map
+	queueConcurrency       sync.Map
+	enableTaskNotification bool
 }
 
 // NewRDB returns a new instance of RDB.
@@ -152,6 +161,7 @@ func (r *RDB) Enqueue(ctx context.Context, msg *base.TaskMessage) error {
 	if n == 0 {
 		return errors.E(op, errors.AlreadyExists, errors.ErrTaskIdConflict)
 	}
+	r.PublishTaskReady(msg.Queue) // best-effort notification
 	return nil
 }
 
@@ -222,6 +232,7 @@ func (r *RDB) EnqueueUnique(ctx context.Context, msg *base.TaskMessage, ttl time
 	if n == 0 {
 		return errors.E(op, errors.AlreadyExists, errors.ErrTaskIdConflict)
 	}
+	r.PublishTaskReady(msg.Queue) // best-effort notification
 	return nil
 }
 
@@ -530,7 +541,11 @@ func (r *RDB) Requeue(ctx context.Context, msg *base.TaskMessage) error {
 		base.PendingKey(msg.Queue),
 		base.TaskKey(msg.Queue, msg.ID),
 	}
-	return r.runScript(ctx, op, requeueCmd, keys, msg.ID)
+	if err := r.runScript(ctx, op, requeueCmd, keys, msg.ID); err != nil {
+		return err
+	}
+	r.PublishTaskReady(msg.Queue) // best-effort notification
+	return nil
 }
 
 // KEYS[1] -> asynq:{<qname>}:t:<task_id>
@@ -1034,6 +1049,7 @@ func (r *RDB) forwardAll(qname string) (err error) {
 	pendingKey := base.PendingKey(qname)
 	taskKeyPrefix := base.TaskKeyPrefix(qname)
 	groupKeyPrefix := base.GroupKeyPrefix(qname)
+	forwarded := false
 	for _, delayedKey := range delayedKeys {
 		n := 1
 		for n != 0 {
@@ -1041,7 +1057,13 @@ func (r *RDB) forwardAll(qname string) (err error) {
 			if err != nil {
 				return err
 			}
+			if n > 0 {
+				forwarded = true
+			}
 		}
+	}
+	if forwarded {
+		r.PublishTaskReady(qname) // best-effort notification
 	}
 	return nil
 }
@@ -1528,6 +1550,36 @@ func (r *RDB) PublishCancelation(id string) error {
 	if err := r.client.Publish(ctx, base.CancelChannel, id).Err(); err != nil {
 		return errors.E(op, errors.Unknown, fmt.Sprintf("redis pubsub publish error: %v", err))
 	}
+	return nil
+}
+
+// TaskReadyPubSub returns a pubsub subscribed to task-ready channels
+// for the given queue names.
+func (r *RDB) TaskReadyPubSub(qnames ...string) (*redis.PubSub, error) {
+	var op errors.Op = "rdb.TaskReadyPubSub"
+	ctx := context.Background()
+	channels := make([]string, len(qnames))
+	for i, qname := range qnames {
+		channels[i] = base.TaskReadyChannel(qname)
+	}
+	pubsub := r.client.Subscribe(ctx, channels...)
+	_, err := pubsub.Receive(ctx)
+	if err != nil {
+		return nil, errors.E(op, errors.Unknown, fmt.Sprintf("redis pubsub receive error: %v", err))
+	}
+	return pubsub, nil
+}
+
+// PublishTaskReady publishes a notification to the task-ready channel
+// for the given queue. This is best-effort and asynchronous: it does
+// not block the caller or propagate errors.
+// No-op if task notification is not enabled via WithTaskNotification.
+func (r *RDB) PublishTaskReady(qname string) error {
+	if !r.enableTaskNotification {
+		return nil
+	}
+	channel := base.TaskReadyChannel(qname)
+	go r.client.Publish(context.Background(), channel, "1")
 	return nil
 }
 

@@ -209,6 +209,24 @@ func (tb *TestBroker) PublishCancelation(id string) error {
 	return tb.real.PublishCancelation(id)
 }
 
+func (tb *TestBroker) TaskReadyPubSub(qnames ...string) (*redis.PubSub, error) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return nil, errRedisDown
+	}
+	return tb.real.TaskReadyPubSub(qnames...)
+}
+
+func (tb *TestBroker) PublishTaskReady(qname string) error {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return errRedisDown
+	}
+	return tb.real.PublishTaskReady(qname)
+}
+
 func (tb *TestBroker) WriteResult(qname, id string, data []byte) (int, error) {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
